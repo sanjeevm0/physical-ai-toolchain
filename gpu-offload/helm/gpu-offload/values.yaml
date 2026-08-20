@@ -9,7 +9,7 @@ image:
   # or set to your registry (e.g. ghcr.io/my-org, docker.io/my-org).
   registry: ""
   # Applied to every container in this chart.
-  pullPolicy: Never
+  pullPolicy: Always
 
 # -- References to registry pull secrets. Leave empty and prefer workload identity
 # (AKS: federated credentials on a managed identity + AcrPull role assignment) so no
@@ -24,11 +24,11 @@ imagePullSecrets: []
 mutate:
   image:
     # -- Real image name consumed from `image.registry`.
-    repository: ghcr.io/sanjeevm0/xavier-controller
+    repository: xavier-mutate
     # -- Leave `tag` empty and set `digest` to a sha256 pin for reproducible,
     # tamper-evident deploys (recommended). When `digest` is set it wins over `tag`.
     # Example: digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-    tag: local-arm64
+    tag: ""
     digest: ""
   # -- TLS port the webhook Service and admission endpoint listen on.
   webhookPort: 6443
@@ -53,7 +53,7 @@ mutate:
 # overridden per-environment.
 mutateScheduling:
   nodeSelector:
-    kubernetes.io/arch: arm64
+    kubernetes.io/arch: amd64
   tolerations: []
   affinity: {}
 
