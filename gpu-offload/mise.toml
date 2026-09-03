@@ -154,6 +154,14 @@ description = "Remove the offload workloads and demo state from the cluster"
 run = "examples/first-run/scripts/teardown.sh"
 
 # ==============================================================================
+# Runtime validation
+# ==============================================================================
+
+[tasks."e-runtime-10-test"]
+description = "Run the remoter runtime unit and multiprocess integration tests"
+run = "uv run --project runtime --extra test pytest -c runtime/pyproject.toml runtime/tests"
+
+# ==============================================================================
 # ur10e-single example
 # ==============================================================================
 
