@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import uuid
 
+_SERVER_ID = str(uuid.uuid4())
+
 
 def add(left: int, right: int) -> int:
     return left + right
@@ -117,3 +119,11 @@ class ReplicatedSingletonAccumulator:
 
     def get_value(self) -> int:
         return self.value
+
+
+class MultiInstanceServerIdentity:
+    def __init__(self) -> None:
+        pass
+
+    def get_server_id(self) -> str:
+        return _SERVER_ID

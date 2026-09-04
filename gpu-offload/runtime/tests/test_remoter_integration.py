@@ -18,6 +18,7 @@ from remoter import remoter, rmtconfigkube
 
 _RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 _RESULT_PREFIX = "REMOTER_TEST_RESULT="
+_DISTRIBUTION_PREFIX = "MULTIINSTANCE_ID_DISTRIBUTION="
 _START_TIMEOUT_SECONDS = 10
 _CLIENT_TIMEOUT_SECONDS = 30
 
@@ -197,6 +198,46 @@ def _parse_result(output: str) -> dict[str, Any]:
     raise AssertionError(f"client did not emit {_RESULT_PREFIX!r}\n{output}")
 
 
+def _write_distribution_config(
+    config_path: Path,
+    location_config_path: Path,
+    first_server_port: int,
+    second_server_port: int,
+) -> None:
+    first_server = f"127.0.0.1:{first_server_port}"
+    second_server = f"127.0.0.1:{second_server_port}"
+    config = {
+        "configfile": str(location_config_path),
+        "remoteclasses": [
+            {
+                "tests.remoter_test_fixture/MultiInstanceServerIdentity": {
+                    "instantiateon": [first_server, second_server],
+                }
+            }
+        ],
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    location_config = {
+        "tests.remoter_test_fixture/MultiInstanceServerIdentity": {
+            "locations": {
+                first_server: 0.5,
+                second_server: 0.5,
+            }
+        }
+    }
+    location_config_path.write_text(
+        yaml.safe_dump(location_config, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _parse_distribution(output: str) -> dict[str, int]:
+    for line in output.splitlines():
+        if line.startswith(_DISTRIBUTION_PREFIX):
+            return json.loads(line.removeprefix(_DISTRIBUTION_PREFIX))
+    raise AssertionError(f"client did not emit {_DISTRIBUTION_PREFIX!r}\n{output}")
+
+
 def test_get_keys_registers_every_instantiateon_server_label() -> None:
     config = {
         "remoteclasses": [
@@ -281,6 +322,45 @@ def test_connection_loss_removes_only_the_failed_replica() -> None:
     }
     assert second_uuid not in runtime.multiLocationObjectsByUUID
     assert second_uuid not in runtime.remotedClassesConn
+
+
+def test_multiinstance_calls_are_distributed_across_servers(tmp_path: Path) -> None:
+    first_server_port = _free_port()
+    second_server_port = _free_port()
+    client_port = _free_port()
+    config_path = tmp_path / "remote.yaml"
+    location_config_path = tmp_path / "locations.yaml"
+    _write_distribution_config(
+        config_path,
+        location_config_path,
+        first_server_port,
+        second_server_port,
+    )
+
+    servers: list[subprocess.Popen[str]] = []
+    try:
+        servers.append(_start_server(config_path, first_server_port, tmp_path / "server-1.log"))
+        servers.append(_start_server(config_path, second_server_port, tmp_path / "server-2.log"))
+
+        client = subprocess.run(
+            [sys.executable, "-m", "tests.remoter_distribution_client"],
+            cwd=_RUNTIME_ROOT,
+            env=_subprocess_env(config_path, client_port),
+            capture_output=True,
+            text=True,
+            timeout=_CLIENT_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+        assert client.returncode == 0, client.stdout + client.stderr
+        distribution = _parse_distribution(client.stdout)
+        print(f"Multiinstance server ID distribution: {distribution}")
+        assert len(distribution) == 2
+        assert sum(distribution.values()) == 100
+        assert all(35 <= count <= 65 for count in distribution.values())
+    finally:
+        for server in reversed(servers):
+            _stop_process(server)
 
 
 def test_remoter_routes_functions_and_classes_across_processes(tmp_path: Path) -> None:
