@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import ssl
 import threading
@@ -35,6 +37,7 @@ DEFAULT_TLS_CERT_PATH = "/tls/tls.crt"
 DEFAULT_TLS_KEY_PATH = "/tls/tls.key"
 DEFAULT_PORT = 8443
 ALLOWED_SERVER_HOST_PATHS_ENV = "ALLOWED_SERVER_HOST_PATHS"
+_NODE_SELECTOR_UNSET = object()
 
 READINESS_PROBE = {
     "exec": {"command": ["cat", "/ready.txt"]},
@@ -99,6 +102,25 @@ def _validate_string_map(value: Any, *, field: str) -> dict[str, str]:
             _validate_string(item, field=f"{field}[{key!r}]")
         )
     return normalized
+
+
+def _validate_node_selector(
+    value: Any,
+    *,
+    field: str,
+) -> dict[str, str] | list[dict[str, str]]:
+    if isinstance(value, dict):
+        return _validate_string_map(value, field=field)
+    if not isinstance(value, list) or not value:
+        raise XavierConfigError(f"{field} must be a mapping or non-empty list of mappings")
+    selectors = [
+        _validate_string_map(selector, field=f"{field}[{index}]")
+        for index, selector in enumerate(value)
+    ]
+    serialized = [json.dumps(selector, sort_keys=True, separators=(",", ":")) for selector in selectors]
+    if len(serialized) != len(set(serialized)):
+        raise XavierConfigError(f"{field} must not contain duplicate mappings")
+    return selectors
 
 
 def _validate_env_list(value: Any, *, field: str) -> list[dict[str, str]]:
@@ -166,7 +188,7 @@ def _validate_stage(stage: Any, *, index: int) -> dict[str, Any]:
         if not isinstance(replicas, int) or replicas < 1:
             raise XavierConfigError(f"serverstages[{index}].serverreplicas must be a positive integer")
     if "nodeSelector" in normalized:
-        normalized["nodeSelector"] = _validate_string_map(
+        normalized["nodeSelector"] = _validate_node_selector(
             normalized["nodeSelector"],
             field=f"serverstages[{index}].nodeSelector",
         )
@@ -207,7 +229,7 @@ def validate_xavier_config(
         if not isinstance(replicas, int) or replicas < 1:
             raise XavierConfigError(f"{source}.serverreplicas must be a positive integer")
     if "nodeSelector" in normalized:
-        normalized["nodeSelector"] = _validate_string_map(normalized["nodeSelector"], field=f"{source}.nodeSelector")
+        normalized["nodeSelector"] = _validate_node_selector(normalized["nodeSelector"], field=f"{source}.nodeSelector")
     if "securityContext" in normalized:
         normalized["securityContext"] = _validate_security_context(
             normalized["securityContext"],
@@ -445,11 +467,55 @@ def get_xavier_container(spec: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _deployment_name(metadata: dict[str, Any], stage: str) -> str:
+def _server_selector_value(metadata: dict[str, Any], stage: str) -> str:
+    server_selector = f"{metadata['name']}-remote-server"
+    if stage:
+        server_selector = f"{server_selector}-{stage}"
+    return _validate_server_selector(server_selector)
+
+
+def _deployment_name(
+    metadata: dict[str, Any],
+    stage: str,
+    selector_suffix: str | None = None,
+) -> str:
     deployment_name = f"{metadata['name']}-remote-server"
     if stage:
         deployment_name = f"{deployment_name}-{stage}"
-    return deployment_name
+    if selector_suffix is not None:
+        deployment_name = f"{deployment_name}-selector-{selector_suffix}"
+    normalized = re.sub(r"[^a-z0-9-]+", "-", deployment_name.lower())
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    if not normalized:
+        raise XavierConfigError("Generated server Deployment name is empty")
+    if len(normalized) > 253:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+        normalized = f"{normalized[:240].rstrip('-')}-{digest}"
+    return normalized
+
+
+def _selector_suffix(selector: dict[str, str]) -> str:
+    serialized = json.dumps(selector, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()[:8]
+
+
+def _app_label(deployment_name: str) -> str:
+    if len(deployment_name) <= 63:
+        return deployment_name
+    digest = hashlib.sha256(deployment_name.encode("utf-8")).hexdigest()[:12]
+    return f"{deployment_name[:50].rstrip('-')}-{digest}"
+
+
+def _validate_server_selector(server_selector: str) -> str:
+    valid_format = re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?",
+        server_selector,
+    )
+    if len(server_selector) > 63 or valid_format is None:
+        raise XavierConfigError(
+            f"Generated server selector {server_selector!r} is not a valid Kubernetes label value"
+        )
+    return server_selector
 
 
 def _api_version_for_owner(owner_obj: dict[str, Any]) -> str:
@@ -558,6 +624,10 @@ def create_server_deployment_spec(
     xavierconfig: dict[str, Any],
     stage: str,
     obj: dict[str, Any],
+    *,
+    deployment_name: str | None = None,
+    server_selector: str | None = None,
+    node_selector: dict[str, str] | object | None = _NODE_SELECTOR_UNSET,
 ) -> dict[str, Any] | None:
     if getparam(xavierconfig, stage, "noserverdeployment") is True:
         return None
@@ -571,7 +641,9 @@ def create_server_deployment_spec(
         return None
 
     replicas = getparam(xavierconfig, stage, "serverreplicas") or 1
-    deployment_name = _deployment_name(metadata, stage)
+    deployment_name = deployment_name or _deployment_name(metadata, stage)
+    server_selector = server_selector or _server_selector_value(metadata, stage)
+    app_label = _app_label(deployment_name)
     namespace = metadata.get("namespace", "default")
     deployment = {
         "apiVersion": "apps/v1",
@@ -580,18 +652,18 @@ def create_server_deployment_spec(
             "name": deployment_name,
             "namespace": namespace,
             "labels": {
-                "app": deployment_name,
+                "app": app_label,
                 XAVIER_DEPLOYMENT_LABEL: "true",
             },
         },
         "spec": {
             "replicas": replicas,
-            "selector": {"matchLabels": {"app": deployment_name}},
+            "selector": {"matchLabels": {"app": app_label}},
             "template": {
                 "metadata": {
                     "labels": {
-                        "app": deployment_name,
-                        SERVER_SELECTOR_LABEL: deployment_name,
+                        "app": app_label,
+                        SERVER_SELECTOR_LABEL: server_selector,
                     }
                 },
                 "spec": {
@@ -633,12 +705,15 @@ def create_server_deployment_spec(
         }
     )
     if env_dict.get("PERCLIENTSERVERLABEL") == "unknown":
-        base_deployment_name = deployment_name[: -(len(stage) + 1)] if stage else deployment_name
-        env_dict["PERCLIENTSERVERLABEL"] = f"{serverlabelkey()}={base_deployment_name}"
+        base_server_selector = _server_selector_value(metadata, "")
+        env_dict["PERCLIENTSERVERLABEL"] = f"{serverlabelkey()}={base_server_selector}"
     container["env"] = [{"name": name, "value": value} for name, value in env_dict.items()]
     _append_value_from_envs(container, xavier_container)
 
-    node_selector = getparam(xavierconfig, stage, "nodeSelector")
+    if node_selector is _NODE_SELECTOR_UNSET:
+        node_selector = getparam(xavierconfig, stage, "nodeSelector")
+        if isinstance(node_selector, list):
+            raise XavierConfigError("nodeSelector lists require server deployment fan-out")
     if node_selector is not None:
         deployment["spec"]["template"]["spec"]["nodeSelector"] = copy.deepcopy(node_selector)
 
@@ -652,6 +727,42 @@ def create_server_deployment_spec(
 
     add_owner_reference(deployment, obj)
     return deployment
+
+
+def build_stage_server_deployments(
+    metadata: dict[str, Any],
+    spec: dict[str, Any],
+    xavierconfig: dict[str, Any],
+    stage: str,
+    obj: dict[str, Any],
+) -> dict[str, dict[str, Any] | None]:
+    base_name = _deployment_name(metadata, stage)
+    server_selector = _server_selector_value(metadata, stage)
+    node_selector = getparam(xavierconfig, stage, "nodeSelector")
+    selectors = node_selector if isinstance(node_selector, list) else [node_selector]
+    if getparam(xavierconfig, stage, "noserverdeployment") is True:
+        return {base_name: None}
+
+    deployments: dict[str, dict[str, Any] | None] = {}
+    for selector in selectors:
+        deployment_name = (
+            _deployment_name(metadata, stage, _selector_suffix(selector))
+            if isinstance(node_selector, list)
+            else base_name
+        )
+        if deployment_name in deployments:
+            raise XavierConfigError(f"nodeSelector entries generate the same Deployment name: {deployment_name}")
+        deployments[deployment_name] = create_server_deployment_spec(
+            metadata,
+            spec,
+            xavierconfig,
+            stage,
+            obj,
+            deployment_name=deployment_name,
+            server_selector=server_selector,
+            node_selector=selector,
+        )
+    return deployments
 
 
 def get_metadata_spec_parent(
@@ -707,6 +818,17 @@ def merge_configmap_config(
     return validate_xavier_config(merged, source="merged xavier config", require_remoteablecm=True)
 
 
+def _merge_desired_deployments(
+    desired: dict[str, dict[str, Any] | None],
+    additions: dict[str, dict[str, Any] | None],
+) -> None:
+    duplicate_names = set(desired) & set(additions)
+    if duplicate_names:
+        names = ", ".join(sorted(duplicate_names))
+        raise XavierConfigError(f"Server deployment names collide: {names}")
+    desired.update(additions)
+
+
 def build_desired_server_deployments(
     obj: dict[str, Any],
     *,
@@ -727,8 +849,10 @@ def build_desired_server_deployments(
             if stageobj.get("perclient", False) and obj.get("kind") != "Pod":
                 continue
             stage_name = stageobj.get("name", "")
-            deployment_name = _deployment_name(metadata, stage_name)
-            desired[deployment_name] = create_server_deployment_spec(metadata, spec, xavierconfig, stage_name, obj)
+            _merge_desired_deployments(
+                desired,
+                build_stage_server_deployments(metadata, spec, xavierconfig, stage_name, obj),
+            )
     if obj.get("kind") == "Pod":
         _, _, parent_cfg = get_metadata_spec_parent(obj, apps_api, batch_api, core_api)
         if metadata is not None and spec is not None and parent_cfg is not None:
@@ -737,9 +861,32 @@ def build_desired_server_deployments(
                 if not stageobj.get("perclient", False):
                     continue
                 stage_name = stageobj.get("name", "")
-                deployment_name = _deployment_name(metadata, stage_name)
-                desired[deployment_name] = create_server_deployment_spec(metadata, spec, xavierconfig, stage_name, obj)
+                _merge_desired_deployments(
+                    desired,
+                    build_stage_server_deployments(metadata, spec, xavierconfig, stage_name, obj),
+                )
     return desired
+
+
+def owned_server_deployment_names(
+    apps_api: client.AppsV1Api,
+    *,
+    namespace: str,
+    owner_uid: str,
+) -> set[str]:
+    deployments = apps_api.list_namespaced_deployment(
+        namespace=namespace,
+        label_selector=f"{XAVIER_DEPLOYMENT_LABEL}=true",
+    )
+    names: set[str] = set()
+    for item in deployments.items:
+        deployment = kubernetes_object_to_dict(item)
+        owner_references = deployment.get("metadata", {}).get("ownerReferences", []) or []
+        if any(reference.get("uid") == owner_uid for reference in owner_references):
+            name = deployment.get("metadata", {}).get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
 
 
 def _normalize_deployment_for_compare(deployment_obj: Any) -> dict[str, Any]:
@@ -760,6 +907,7 @@ def reconcile_named_server_deployment(
     namespace: str,
     deployment_name: str,
     desired_spec: dict[str, Any] | None,
+    owner_uid: str | None = None,
 ) -> str:
     try:
         existing = apps_api.read_namespaced_deployment(name=deployment_name, namespace=namespace)
@@ -770,6 +918,18 @@ def reconcile_named_server_deployment(
             return "absent"
         apps_api.create_namespaced_deployment(namespace=namespace, body=desired_spec)
         return "created"
+
+    existing_dict = kubernetes_object_to_dict(existing)
+    if owner_uid is not None:
+        metadata = existing_dict.get("metadata", {})
+        labels = metadata.get("labels", {}) or {}
+        owner_references = metadata.get("ownerReferences", []) or []
+        managed = labels.get(XAVIER_DEPLOYMENT_LABEL) == "true"
+        owned = any(reference.get("uid") == owner_uid for reference in owner_references)
+        if not managed or not owned:
+            raise XavierConfigError(
+                f"Deployment {namespace}/{deployment_name} exists but is not owned by this workload"
+            )
 
     if desired_spec is None:
         apps_api.delete_namespaced_deployment(name=deployment_name, namespace=namespace)
@@ -797,6 +957,7 @@ def reconcile_object(
         batch_api=batch_api,
     )
     namespace = obj.get("metadata", {}).get("namespace", "default")
+    owner_uid = obj.get("metadata", {}).get("uid")
     outcomes: dict[str, str] = {}
     for deployment_name, desired_spec in desired_deployments.items():
         outcomes[deployment_name] = reconcile_named_server_deployment(
@@ -804,8 +965,44 @@ def reconcile_object(
             namespace=namespace,
             deployment_name=deployment_name,
             desired_spec=desired_spec,
+            owner_uid=owner_uid if isinstance(owner_uid, str) else None,
         )
+    if isinstance(owner_uid, str) and owner_uid:
+        stale_names = owned_server_deployment_names(
+            apps_api,
+            namespace=namespace,
+            owner_uid=owner_uid,
+        ) - set(desired_deployments)
+        for deployment_name in stale_names:
+            outcomes[deployment_name] = reconcile_named_server_deployment(
+                apps_api,
+                namespace=namespace,
+                deployment_name=deployment_name,
+                desired_spec=None,
+                owner_uid=owner_uid,
+            )
     return outcomes
+
+
+def workload_references_config_map(
+    obj: dict[str, Any],
+    *,
+    config_map_name: str,
+    namespace: str,
+    core_api: client.CoreV1Api,
+    apps_api: client.AppsV1Api,
+    batch_api: client.BatchV1Api,
+) -> bool:
+    metadata = obj.get("metadata", {})
+    if metadata.get("namespace", "default") != namespace:
+        return False
+    if obj.get("kind") == "Pod" and _is_parent_labeled_pod(metadata):
+        _, _, parent_cfg = get_metadata_spec_parent(obj, apps_api, batch_api, core_api)
+        return parent_cfg is not None and parent_cfg.get("remoteablecm") == config_map_name
+    _, _, xaviercfg = get_metadata_spec(obj)
+    if xaviercfg is not None:
+        return xaviercfg.get("remoteablecm") == config_map_name
+    return False
 
 
 def _json_pointer_escape(token: str) -> str:
@@ -925,6 +1122,47 @@ class XavierAdmissionController:
             raise RuntimeError("Kubernetes clients are not configured for reconciliation")
         return reconcile_object(obj, core_api=self.core_api, apps_api=self.apps_api, batch_api=self.batch_api)
 
+    def reconcile_config_map(self, obj: dict[str, Any]) -> None:
+        if self.core_api is None or self.apps_api is None or self.batch_api is None:
+            raise RuntimeError("Kubernetes clients are not configured for reconciliation")
+        metadata = obj.get("metadata", {})
+        config_map_name = metadata.get("name")
+        namespace = metadata.get("namespace", "default")
+        if not isinstance(config_map_name, str) or not config_map_name:
+            return
+        for list_fn in (
+            self.core_api.list_namespaced_pod,
+            self.apps_api.list_namespaced_deployment,
+            self.batch_api.list_namespaced_job,
+            self.apps_api.list_namespaced_stateful_set,
+        ):
+            for item in list_fn(namespace=namespace).items:
+                workload = kubernetes_object_to_dict(item)
+                try:
+                    if workload_references_config_map(
+                        workload,
+                        config_map_name=config_map_name,
+                        namespace=namespace,
+                        core_api=self.core_api,
+                        apps_api=self.apps_api,
+                        batch_api=self.batch_api,
+                    ):
+                        self.reconcile_object(workload)
+                except XavierConfigError as exc:
+                    logger.warning(
+                        "Skipping ConfigMap reconcile for %s/%s: %s",
+                        workload.get("kind"),
+                        workload.get("metadata", {}).get("name"),
+                        exc,
+                    )
+                except client.exceptions.ApiException as exc:
+                    logger.warning(
+                        "Kubernetes API error during ConfigMap reconcile for %s/%s: %s",
+                        workload.get("kind"),
+                        workload.get("metadata", {}).get("name"),
+                        exc,
+                    )
+
 
 class AdmissionHTTPRequestHandler(BaseHTTPRequestHandler):
     server_version = "gpu-offload-controller/1.0"
@@ -1012,6 +1250,7 @@ class ReconcileRuntime:
             ("Deployment", self.controller.apps_api.list_deployment_for_all_namespaces),
             ("Job", self.controller.batch_api.list_job_for_all_namespaces),
             ("StatefulSet", self.controller.apps_api.list_stateful_set_for_all_namespaces),
+            ("ConfigMap", self.controller.core_api.list_config_map_for_all_namespaces),
         ):
             thread = threading.Thread(target=self._watch_kind, args=(kind, list_fn), daemon=True)
             thread.start()
@@ -1054,7 +1293,10 @@ class ReconcileRuntime:
 
     def _reconcile_obj(self, obj: dict[str, Any]) -> None:
         try:
-            self.controller.reconcile_object(obj)
+            if obj.get("kind") == "ConfigMap":
+                self.controller.reconcile_config_map(obj)
+            else:
+                self.controller.reconcile_object(obj)
         except XavierConfigError as exc:
             logger.warning(
                 "Skipping reconcile for %s/%s: %s", obj.get("kind"), obj.get("metadata", {}).get("name"), exc
@@ -1122,15 +1364,18 @@ __all__ = [
     "XavierConfigError",
     "admission_response",
     "build_desired_server_deployments",
+    "build_stage_server_deployments",
     "create_json_patch",
     "create_server_deployment_spec",
     "get_metadata_spec",
     "get_metadata_spec_parent",
     "getserverlabel",
     "merge_configmap_config",
+    "owned_server_deployment_names",
     "reconcile_named_server_deployment",
     "reconcile_object",
     "validate_xavier_config",
+    "workload_references_config_map",
 ]
 
 
