@@ -161,6 +161,10 @@ run = "examples/first-run/scripts/teardown.sh"
 description = "Run the remoter runtime unit and multiprocess integration tests"
 run = "uv run --project runtime --extra test pytest -c runtime/pyproject.toml runtime/tests"
 
+[tasks."e-runtime-20-test-kubernetes"]
+description = "Test multiinstance routing while scaling Kubernetes server pods"
+run = "scripts/test-runtime-kubernetes-scaling.sh"
+
 # ==============================================================================
 # ur10e-single example
 # ==============================================================================
