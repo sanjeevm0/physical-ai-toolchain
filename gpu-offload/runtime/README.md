@@ -233,7 +233,24 @@ Calls only select active locations that have a successfully created instance.
 > update the other instances. Use multi-location classes for immutable models,
 > stateless services, or classes that synchronize state externally.
 
-`instantiateon` and `singleinstance` cannot be enabled on the same class.
+Combine `instantiateon` with `singleinstance` to create one singleton at each
+location. Repeated constructors and factories return the same client proxy and
+reuse the location-specific instance:
+
+```yaml
+remoteclasses:
+  - application.models/Policy:
+      instantiateon:
+        - 10.0.0.10:9000
+        - 10.0.0.11:9000
+      singleinstance: true
+```
+
+Each location initializes its singleton independently on first creation.
+Constructor arguments from later calls do not reinitialize existing instances.
+Removing a location detaches its cached client stub but preserves the
+server-process singleton. Re-adding that location reconnects to the same
+instance and state while the server process remains alive.
 Multi-location creation currently requires synchronous constructors and factory
 functions.
 

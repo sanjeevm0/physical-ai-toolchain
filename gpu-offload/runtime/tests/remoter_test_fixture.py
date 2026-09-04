@@ -32,6 +32,10 @@ def create_second_server_accumulator(value: int) -> SecondServerAccumulator:
     return SecondServerAccumulator(value)
 
 
+def create_replicated_singleton(value: int) -> ReplicatedSingletonAccumulator:
+    return ReplicatedSingletonAccumulator(value)
+
+
 class Accumulator:
     def __init__(self, value: int) -> None:
         self.value = value
@@ -90,6 +94,26 @@ class SecondServerAccumulator:
 
     def get_created_by_pid(self) -> int:
         return self.created_by_pid
+
+    def get_value(self) -> int:
+        return self.value
+
+
+class ReplicatedSingletonAccumulator:
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self.instance_id = str(uuid.uuid4())
+        self.created_by_pid = os.getpid()
+
+    def add(self, amount: int) -> int:
+        self.value += amount
+        return self.value
+
+    def get_created_by_pid(self) -> int:
+        return self.created_by_pid
+
+    def get_instance_id(self) -> str:
+        return self.instance_id
 
     def get_value(self) -> int:
         return self.value

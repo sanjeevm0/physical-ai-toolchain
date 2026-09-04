@@ -402,6 +402,19 @@ class MetaRemotedUUID:
                 x = getclassinstancefromname(class_to_stub[self.name])
             else:  # on server side, always get actual class
                 x = getclassinstancefromname(self.name)
+            if (
+                not isserver
+                and getattr(type(x), "singleinstance_rmt0bf", False)
+                and getattr(type(x), "instantiateon_rmt0bf", ())
+            ):
+                with singleinstanceclasslock:
+                    if (
+                        localhasattr(x, "rmtsingletonclaimed_rmt0bf")
+                        and object.__getattribute__(x, "rmtsingletonclaimed_rmt0bf")
+                    ):
+                        x = object.__new__(type(x))
+                    else:
+                        x.rmtsingletonclaimed_rmt0bf = True
         else:
             x = self.obj
         x.uuid_rmt0bf = self.uuid_rmt0bf
@@ -1482,6 +1495,12 @@ class Remoter:
                 if not localhasattr(args[0], "uuid_rmt0bf") or args[0].uuid_rmt0bf is None:  # not init yet
                     initfields(args[0])
                     logger.debug(f"Initializing remote class on client with id {args[0].uuid_rmt0bf}")
+                if (
+                    getattr(type(args[0]), "singleinstance_rmt0bf", False)
+                    and self.isMultiLocationClass(args[0])
+                ):
+                    with singleinstanceclasslock:
+                        args[0].rmtsingletonclaimed_rmt0bf = True
 
     def islocself(self, loc: str) -> bool:
         if loc == "direct":
@@ -1699,6 +1718,16 @@ class Remoter:
 
     def replaceKnownMultiLocationObjects(self, value: Any) -> Any:
         if type(value) in remotedclasses and self.isMultiLocationClass(value):
+            if getattr(type(value), "singleinstance_rmt0bf", False):
+                cached = singleinstanceclassinstance.get(classkey(type(value)))
+                if cached is not None:
+                    canonical = cached[1]
+                    if (
+                        canonical is not value
+                        and localhasattr(canonical, "rmtsingletonclaimed_rmt0bf")
+                        and object.__getattribute__(canonical, "rmtsingletonclaimed_rmt0bf")
+                    ):
+                        return canonical
             classuid = object.__getattribute__(value, "uuid_rmt0bf")
             return self.multiLocationObjectsByUUID.get(classuid, value)
         if isinstance(value, list):
@@ -1727,6 +1756,14 @@ class Remoter:
         if not locations:
             raise RuntimeError(f"No instantiation locations configured for {type(canonical)}")
         with self.multiLocationLock:
+            if (
+                getattr(type(canonical), "singleinstance_rmt0bf", False)
+                and localhasattr(canonical, "rmtcreationid_rmt0bf")
+                and object.__getattribute__(canonical, "rmtcreationid_rmt0bf") is not None
+            ):
+                return
+            if getattr(type(canonical), "singleinstance_rmt0bf", False):
+                canonical.rmtsingletonclaimed_rmt0bf = True
             creation_id = uuid.uuid4()
             record = MultiLocationCreation(
                 creation_id=creation_id,
@@ -1747,7 +1784,7 @@ class Remoter:
                     if index == 0:
                         instance = canonical
                     else:
-                        instance = getclassinstancefromname(classkey(type(canonical)))
+                        instance = object.__new__(type(canonical))
                     initfields(instance)
                     call_args = (instance, *args[1:])
                     self.runSyncFunctionOnce(taskname, functype, nowait, timeout, loc, func, *call_args, **kwargs)
@@ -1758,6 +1795,11 @@ class Remoter:
                 for stub in created:
                     self.deallocateClassStub(stub)
                     self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
+                instances = object.__getattribute__(canonical, "rmtinstances_rmt0bf")
+                instances.clear()
+                canonical.rmtcreationid_rmt0bf = None
+                if getattr(type(canonical), "singleinstance_rmt0bf", False):
+                    canonical.rmtsingletonclaimed_rmt0bf = False
                 canonical.failed_rmt0bf = True
                 raise
 
@@ -1788,6 +1830,10 @@ class Remoter:
             raise RuntimeError("Multi-location factory creation requires a known execution location")
 
         with self.multiLocationLock:
+            result = self.replaceKnownMultiLocationObjects(result)
+            objects = self.collectNewMultiLocationObjects(result)
+            if not objects:
+                return result
             creation_id = uuid.uuid4()
             record = MultiLocationCreation(
                 creation_id=creation_id,
@@ -1843,6 +1889,9 @@ class Remoter:
                         self.deallocateClassStub(stub)
                         self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
                     instances.clear()
+                    obj.rmtcreationid_rmt0bf = None
+                    if getattr(type(obj), "singleinstance_rmt0bf", False):
+                        obj.rmtsingletonclaimed_rmt0bf = False
                     obj.failed_rmt0bf = True
                 raise
         return result
@@ -1850,7 +1899,7 @@ class Remoter:
     def replayMultiLocationCreation(self, record: MultiLocationCreation, loc: str) -> None:
         if record.constructor:
             canonical = record.objects[()]
-            instance = getclassinstancefromname(classkey(type(canonical)))
+            instance = object.__new__(type(canonical))
             initfields(instance)
             self.runSyncFunctionOnce(
                 record.taskname,

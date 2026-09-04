@@ -213,8 +213,6 @@ def allowallfunctions(cls, isserver):
     instantiateon = remoter.getparam("instantiateon", actclasskey+"/", actclasskey, [])
     if not isinstance(instantiateon, list) or not all(isinstance(loc, str) for loc in instantiateon):
         raise TypeError(f"instantiateon for {actclasskey} must be a list of locations")
-    if instantiateon and singleinstanceclass:
-        raise ValueError(f"{actclasskey} cannot use both instantiateon and singleinstance")
     remotelocclass = remoter.getparam("remoteloc", actclasskey+"/", actclasskey, None)
     if instantiateon and remotelocclass is not None:
         raise ValueError(f"{actclasskey} cannot use both instantiateon and remoteloc")
@@ -232,6 +230,8 @@ def allowallfunctions(cls, isserver):
     setattr(cls, "remoteable_rmt0bf", remoteableclass)
     setattr(cls, "singleinstance_rmt0bf", singleinstanceclass)
     cls.instantiateon_rmt0bf = tuple(instantiateon)
+    if instantiateon and singleinstanceclass and not isserver:
+        cls.__new__ = remoter.singleton_new
     if remoteableclass:
         setattr(cls, "__getattribute__", getattribute)
         setattr(cls, "__setattr__", setattribute)

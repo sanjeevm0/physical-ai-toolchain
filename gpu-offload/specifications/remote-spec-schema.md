@@ -106,8 +106,15 @@ that location. When a location is removed, its object is deallocated. Calls use
 the runtime location weights and only select locations with a cached instance.
 
 Replicas do not synchronize in-memory state. Use this mode for immutable,
-stateless, or externally synchronized classes. `instantiateon` and
-`singleinstance` are mutually exclusive.
+stateless, or externally synchronized classes.
+
+Set `singleinstance: true` with `instantiateon` to create one singleton per
+runtime location. Repeated constructors and factory functions reuse those
+location-specific instances. Each location initializes independently, and later
+constructor arguments do not reinitialize an existing singleton. Removing a
+location detaches its client stub but preserves the singleton in that server
+process. Re-adding the location reconnects to the same instance and state while
+the server process remains alive.
 
 ## remotefuncs
 
@@ -209,7 +216,7 @@ Implementers should validate:
    `module.path//function` or `module.path/Class/method`
 5. Each class defines exactly one of `remoteloc` or `instantiateon`
 6. Every `instantiateon` entry references a declared stage
-7. `instantiateon` and `singleinstance` are not combined
+7. `singleinstance` with `instantiateon` means one singleton per location
 
 ## Workload Opt-In Contract
 

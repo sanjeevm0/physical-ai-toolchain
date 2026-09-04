@@ -59,6 +59,89 @@ def main() -> None:
     bundle_initial_locations = sorted(bundle_replica.rmtinstances_rmt0bf)
     returned_constructor = constructor_replica.return_self()
 
+    singleton_class_key = "tests.remoter_test_fixture/ReplicatedSingletonAccumulator"
+    replicated_singleton = remoter_test_fixture.ReplicatedSingletonAccumulator(200)
+    repeated_singleton = remoter_test_fixture.ReplicatedSingletonAccumulator(999)
+    replicated_singleton_same_proxy = replicated_singleton is repeated_singleton
+
+    remoter.remoter.updateRunLoc(
+        {
+            singleton_class_key: {
+                "locations": {
+                    first_server: 1.0,
+                    second_server: 0.0,
+                }
+            }
+        }
+    )
+    replicated_singleton_first_id = replicated_singleton.get_instance_id()
+    replicated_singleton_first_pid = replicated_singleton.get_created_by_pid()
+    replicated_singleton_first_value = repeated_singleton.add(5)
+
+    remoter.remoter.updateRunLoc(
+        {
+            singleton_class_key: {
+                "locations": {
+                    first_server: 0.0,
+                    second_server: 1.0,
+                }
+            }
+        }
+    )
+    replicated_singleton_second_id = replicated_singleton.get_instance_id()
+    replicated_singleton_second_pid = replicated_singleton.get_created_by_pid()
+    replicated_singleton_second_value = repeated_singleton.add(7)
+
+    factory_singleton = remoter_test_fixture.create_replicated_singleton(777)
+    replicated_singleton_factory_same_proxy = factory_singleton is replicated_singleton
+
+    remoter.remoter.updateRunLoc(
+        {
+            singleton_class_key: {
+                "locations": {
+                    first_server: 1.0,
+                    second_server: 0.0,
+                }
+            }
+        }
+    )
+    replicated_singleton_factory_first_value = factory_singleton.get_value()
+
+    remoter.remoter.updateRunLoc(
+        {
+            singleton_class_key: {
+                "locations": {
+                    first_server: 0.0,
+                    second_server: 1.0,
+                }
+            }
+        }
+    )
+    replicated_singleton_factory_second_value = factory_singleton.get_value()
+
+    remoter.remoter.updateRunLoc(
+        {singleton_class_key: {"locations": {first_server: 1.0}}}
+    )
+    replicated_singleton_after_removal = sorted(
+        replicated_singleton.rmtinstances_rmt0bf
+    )
+
+    remoter.remoter.updateRunLoc(
+        {
+            singleton_class_key: {
+                "locations": {
+                    first_server: 0.0,
+                    second_server: 1.0,
+                }
+            }
+        }
+    )
+    replicated_singleton_after_addition = sorted(
+        replicated_singleton.rmtinstances_rmt0bf
+    )
+    replicated_singleton_readded_id = replicated_singleton.get_instance_id()
+    replicated_singleton_readded_value = replicated_singleton.get_value()
+
     remoter.remoter.updateRunLoc(
         {
             class_key: {
@@ -160,6 +243,27 @@ def main() -> None:
         ),
         "second_server_replica_pid": second_server_replica.get_created_by_pid(),
         "second_server_replica_value": second_server_replica.get_value(),
+        "replicated_singleton_same_proxy": replicated_singleton_same_proxy,
+        "replicated_singleton_factory_same_proxy": replicated_singleton_factory_same_proxy,
+        "replicated_singleton_first_id": replicated_singleton_first_id,
+        "replicated_singleton_second_id": replicated_singleton_second_id,
+        "replicated_singleton_ids_differ": (
+            replicated_singleton_first_id != replicated_singleton_second_id
+        ),
+        "replicated_singleton_first_pid": replicated_singleton_first_pid,
+        "replicated_singleton_second_pid": replicated_singleton_second_pid,
+        "replicated_singleton_first_value": replicated_singleton_first_value,
+        "replicated_singleton_second_value": replicated_singleton_second_value,
+        "replicated_singleton_factory_first_value": (
+            replicated_singleton_factory_first_value
+        ),
+        "replicated_singleton_factory_second_value": (
+            replicated_singleton_factory_second_value
+        ),
+        "replicated_singleton_after_removal": replicated_singleton_after_removal,
+        "replicated_singleton_after_addition": replicated_singleton_after_addition,
+        "replicated_singleton_readded_id": replicated_singleton_readded_id,
+        "replicated_singleton_readded_value": replicated_singleton_readded_value,
     }
     print(f"REMOTER_TEST_RESULT={json.dumps(result, sort_keys=True)}", flush=True)
 

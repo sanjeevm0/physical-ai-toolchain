@@ -119,6 +119,12 @@ def _write_config(
                     "instantiateon": [second_server],
                 }
             },
+            {
+                "tests.remoter_test_fixture/ReplicatedSingletonAccumulator": {
+                    "instantiateon": [first_server, second_server],
+                    "singleinstance": True,
+                }
+            },
         ],
         "remotefuncs": [
             {
@@ -156,6 +162,11 @@ def _write_config(
                     "remoteloc": first_server,
                 }
             },
+            {
+                "tests.remoter_test_fixture//create_replicated_singleton": {
+                    "remoteloc": first_server,
+                }
+            },
         ],
     }
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -165,7 +176,13 @@ def _write_config(
                 first_server: 0.5,
                 second_server: 0.5,
             }
-        }
+        },
+        "tests.remoter_test_fixture/ReplicatedSingletonAccumulator": {
+            "locations": {
+                first_server: 0.5,
+                second_server: 0.5,
+            }
+        },
     }
     location_config_path.write_text(
         yaml.safe_dump(location_config, sort_keys=False),
@@ -359,6 +376,23 @@ def test_remoter_routes_functions_and_classes_across_processes(tmp_path: Path) -
             "second_server_replica_locations": [f"tcp://{second_server}"],
             "second_server_replica_pid": result["constructor_server_pid"],
             "second_server_replica_value": 120,
+            "replicated_singleton_same_proxy": True,
+            "replicated_singleton_factory_same_proxy": True,
+            "replicated_singleton_first_id": result["replicated_singleton_first_id"],
+            "replicated_singleton_second_id": result["replicated_singleton_second_id"],
+            "replicated_singleton_ids_differ": True,
+            "replicated_singleton_first_pid": result["factory_server_pid"],
+            "replicated_singleton_second_pid": result["constructor_server_pid"],
+            "replicated_singleton_first_value": 205,
+            "replicated_singleton_second_value": 207,
+            "replicated_singleton_factory_first_value": 205,
+            "replicated_singleton_factory_second_value": 207,
+            "replicated_singleton_after_removal": [f"tcp://{first_server}"],
+            "replicated_singleton_after_addition": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "replicated_singleton_readded_id": result["replicated_singleton_second_id"],
+            "replicated_singleton_readded_value": 207,
         }
         assert "ValueError" in result["remote_error"]
         assert "expected remote failure" in result["remote_error"]
