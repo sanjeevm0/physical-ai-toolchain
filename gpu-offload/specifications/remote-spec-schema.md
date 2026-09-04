@@ -1,9 +1,11 @@
 ---
 title: remote.yaml Schema
 description: Schema and examples for remote.yaml offload specification
-ms.date: 2026-08-10
+ms.date: 2026-09-03
 ms.topic: reference
 ---
+
+<!-- cspell:ignore instantiateon -->
 
 Specification for the `remote.yaml` ConfigMap consumed by the offload controller.
 The ConfigMap is referenced by annotation `xavierconfig` and contains this schema
@@ -25,21 +27,29 @@ keeps the robot container lightweight while GPU capacity is reserved for inferen
 `remote.yaml` declares three optional top-level keys. At least one of `serverstages`,
 `remoteclasses`, or `remotefuncs` must be present.
 
+<!-- markdownlint-disable MD013 -->
+
 | Key             | Type             | Required | Purpose                                 |
 |-----------------|------------------|----------|-----------------------------------------|
 | `serverstages`  | list of objects  | Yes      | Define named GPU worker pods            |
 | `remoteclasses` | list of mappings | No       | Classes whose methods execute in stages |
 | `remotefuncs`   | list of mappings | No       | Functions that execute in stages        |
 
+<!-- markdownlint-enable MD013 -->
+
 ## serverstages
 
 A **stage** is a GPU worker pod hosting offloaded classes and functions.
+
+<!-- markdownlint-disable MD013 -->
 
 | Field       | Type    | Required | Meaning                                     |
 |-------------|---------|----------|---------------------------------------------|
 | `name`      | string  | Yes      | Stage identifier (empty string is default)  |
 | `perclient` | boolean | Yes      | `false`: shared pod; `true`: per-client pod |
 | `resources` | map     | Yes      | Kubernetes resource requests/limits         |
+
+<!-- markdownlint-enable MD013 -->
 
 **Example:**
 
@@ -61,10 +71,15 @@ Each entry is a single-key map: the key is a fully-qualified class path, value
 selects the target stage. Method calls on instances execute transparently in the
 stage pod.
 
-| Field       | Type   | Required | Meaning                                    |
-|-------------|--------|----------|--------------------------------------------|
-| _(map key)_ | string | Yes      | Class path in `module.path/ClassName` form |
-| `remoteloc` | string | Yes      | Target `serverstages` entry `name`         |
+<!-- markdownlint-disable MD013 -->
+
+| Field           | Type            | Required | Meaning                                    |
+|-----------------|-----------------|----------|--------------------------------------------|
+| _(map key)_     | string          | Yes      | Class path in `module.path/ClassName` form |
+| `remoteloc`     | string          | No       | Single target `serverstages` entry         |
+| `instantiateon` | list of strings | No       | Stages that each host a class instance     |
+
+<!-- markdownlint-enable MD013 -->
 
 **Example:**
 
@@ -74,17 +89,41 @@ remoteclasses:
       remoteloc: gpu
 ```
 
+Use `instantiateon` to maintain one independently constructed instance at every
+listed stage:
+
+```yaml
+remoteclasses:
+  - "mypackage.policy/Policy":
+      instantiateon:
+        - gpu-a
+        - gpu-b
+```
+
+The runtime stores the constructor or factory call used to create the logical
+object. When stage discovery adds a runtime location, the call is replayed at
+that location. When a location is removed, its object is deallocated. Calls use
+the runtime location weights and only select locations with a cached instance.
+
+Replicas do not synchronize in-memory state. Use this mode for immutable,
+stateless, or externally synchronized classes. `instantiateon` and
+`singleinstance` are mutually exclusive.
+
 ## remotefuncs
 
 Each entry is a single-key map: the key is a fully-qualified function path, value
 selects the target stage and declares instancing semantics. Calls execute
 transparently in the stage pod.
 
+<!-- markdownlint-disable MD013 -->
+
 | Field            | Type    | Required | Meaning                                                                                                      |
 |------------------|---------|----------|--------------------------------------------------------------------------------------------------------------|
 | _(map key)_      | string  | Yes      | Path in `module.path//function` or `module.path/Class/method` form                                           |
 | `singleinstance` | boolean | No       | `true`: called once, then the first result is memoized and returned to every later caller; `false`: per-call |
 | `remoteloc`      | string  | Yes      | Target `serverstages` entry `name`                                                                           |
+
+<!-- markdownlint-enable MD013 -->
 
 Set `singleinstance: true` on functions that load heavy resources so the model
 loads once in the stage pod and every call reuses it.
@@ -135,6 +174,8 @@ The following fields in the ConfigMap annotation are deprecated in favor of
 per-stage configuration. They are currently used by the controller but should
 not be relied upon in new code.
 
+<!-- markdownlint-disable MD013 -->
+
 | Field                | Type    | Implemented | Purpose                                   |
 |----------------------|---------|-------------|-------------------------------------------|
 | `serverimage`        | string  | Implemented | Image for server deployment               |
@@ -145,6 +186,8 @@ not be relied upon in new code.
 | `noserverdeployment` | boolean | Implemented | Skip server deployment creation           |
 | `remoteablecm`       | string  | Implemented | ConfigMap name (required)                 |
 | `remoteableconts`    | list    | Implemented | Container names to mutate (optional)      |
+
+<!-- markdownlint-enable MD013 -->
 
 Future work will move configuration into the stage definitions above and deprecate
 these top-level fields.
@@ -162,8 +205,11 @@ Implementers should validate:
 1. Each `serverstages[*].name` is unique
 2. Each `remoteloc` references a declared stage `name`
 3. `resources.limits.nvidia.com/gpu` is a positive integer when GPU offloading
-4. Class paths follow `module.path/ClassName`; function paths use `module.path//function` or `module.path/Class/method`
-5. `singleinstance` is only used for functions/methods, not classes
+4. Class paths use `module.path/ClassName`; function paths use
+   `module.path//function` or `module.path/Class/method`
+5. Each class defines exactly one of `remoteloc` or `instantiateon`
+6. Every `instantiateon` entry references a declared stage
+7. `instantiateon` and `singleinstance` are not combined
 
 ## Workload Opt-In Contract
 

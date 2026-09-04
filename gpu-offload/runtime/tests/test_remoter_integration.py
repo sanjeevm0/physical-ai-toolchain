@@ -5,11 +5,16 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
+
+from remoter import remoter, rmtconfigkube
 
 _RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 _RESULT_PREFIX = "REMOTER_TEST_RESULT="
@@ -82,8 +87,16 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
-def _write_config(config_path: Path, first_server_port: int, second_server_port: int) -> None:
+def _write_config(
+    config_path: Path,
+    location_config_path: Path,
+    first_server_port: int,
+    second_server_port: int,
+) -> None:
+    first_server = f"127.0.0.1:{first_server_port}"
+    second_server = f"127.0.0.1:{second_server_port}"
     config = {
+        "configfile": str(location_config_path),
         "remoteclasses": [
             {
                 "tests.remoter_test_fixture/Accumulator": {
@@ -92,8 +105,18 @@ def _write_config(config_path: Path, first_server_port: int, second_server_port:
             },
             {
                 "tests.remoter_test_fixture/SingletonAccumulator": {
-                    "remoteloc": f"127.0.0.1:{second_server_port}",
+                    "remoteloc": second_server,
                     "singleinstance": True,
+                }
+            },
+            {
+                "tests.remoter_test_fixture/ReplicatedAccumulator": {
+                    "instantiateon": [first_server, second_server],
+                }
+            },
+            {
+                "tests.remoter_test_fixture/SecondServerAccumulator": {
+                    "instantiateon": [second_server],
                 }
             },
         ],
@@ -115,12 +138,39 @@ def _write_config(config_path: Path, first_server_port: int, second_server_port:
             },
             {
                 "tests.remoter_test_fixture//create_accumulator": {
-                    "remoteloc": f"127.0.0.1:{first_server_port}",
+                    "remoteloc": first_server,
+                }
+            },
+            {
+                "tests.remoter_test_fixture//create_replicated_accumulator": {
+                    "remoteloc": first_server,
+                }
+            },
+            {
+                "tests.remoter_test_fixture//create_replicated_bundle": {
+                    "remoteloc": first_server,
+                }
+            },
+            {
+                "tests.remoter_test_fixture//create_second_server_accumulator": {
+                    "remoteloc": first_server,
                 }
             },
         ],
     }
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    location_config = {
+        "tests.remoter_test_fixture/ReplicatedAccumulator": {
+            "locations": {
+                first_server: 0.5,
+                second_server: 0.5,
+            }
+        }
+    }
+    location_config_path.write_text(
+        yaml.safe_dump(location_config, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _parse_result(output: str) -> dict[str, Any]:
@@ -130,12 +180,106 @@ def _parse_result(output: str) -> dict[str, Any]:
     raise AssertionError(f"client did not emit {_RESULT_PREFIX!r}\n{output}")
 
 
+def test_get_keys_registers_every_instantiateon_server_label() -> None:
+    config = {
+        "remoteclasses": [
+            {
+                "tests.remoter_test_fixture/ReplicatedAccumulator": {
+                    "serverlabels": ["stage-a=true", "stage-b=true"],
+                }
+            }
+        ]
+    }
+
+    keys = rmtconfigkube.get_keys(config)
+
+    expected = {"tests.remoter_test_fixture/ReplicatedAccumulator"}
+    assert keys == {
+        "stage-a=true": expected,
+        "stage-b=true": expected,
+    }
+
+
+def test_createconfig_combines_locations_for_replicated_classes() -> None:
+    keys = {
+        "stage-a=true": {"module/Replicated"},
+        "stage-b=true": {"module/Replicated"},
+    }
+    locations = {
+        "stage-a=true": {"10.0.0.1:9000"},
+        "stage-b=true": {"10.0.0.2:9000"},
+    }
+
+    config = rmtconfigkube.createconfig(keys, locations)
+
+    assert config == {
+        "module/Replicated": {
+            "locations": {
+                "10.0.0.1:9000": 0.5,
+                "10.0.0.2:9000": 0.5,
+            }
+        }
+    }
+
+
+def test_connection_loss_removes_only_the_failed_replica() -> None:
+    class ReplicatedProxy:
+        instantiateon_rmt0bf = ("first", "second")
+
+    first_uuid = uuid.uuid4()
+    second_uuid = uuid.uuid4()
+    first_loc = "tcp://127.0.0.1:8000"
+    second_loc = "tcp://127.0.0.1:9000"
+    proxy = ReplicatedProxy()
+    proxy.failed_rmt0bf = False
+    proxy.uuid_rmt0bf = second_uuid
+    proxy.rmtloc_rmt0bf = second_loc
+    proxy.rmtinstances_rmt0bf = {
+        first_loc: SimpleNamespace(uuid_rmt0bf=first_uuid, rmtloc_rmt0bf=first_loc),
+        second_loc: SimpleNamespace(uuid_rmt0bf=second_uuid, rmtloc_rmt0bf=second_loc),
+    }
+
+    runtime = remoter.Remoter.createemptyinstance()
+    runtime.connlock = threading.Lock()
+    runtime.multiLocationLock = threading.RLock()
+    runtime.multiLocationObjectsByUUID = {second_uuid: proxy}
+    runtime.remotedClassesConn = {second_uuid: object()}
+    runtime.events = {}
+    runtime.conns = {
+        second_loc: {
+            "alive": True,
+            "classes": {second_uuid: object()},
+            "fnuid": set(),
+            "lock": threading.Lock(),
+        }
+    }
+
+    runtime.closeclientconn(second_loc, SimpleNamespace(), "unused")
+
+    assert proxy.failed_rmt0bf is False
+    assert proxy.uuid_rmt0bf == first_uuid
+    assert proxy.rmtloc_rmt0bf == first_loc
+    assert proxy.rmtinstances_rmt0bf == {
+        first_loc: SimpleNamespace(uuid_rmt0bf=first_uuid, rmtloc_rmt0bf=first_loc)
+    }
+    assert second_uuid not in runtime.multiLocationObjectsByUUID
+    assert second_uuid not in runtime.remotedClassesConn
+
+
 def test_remoter_routes_functions_and_classes_across_processes(tmp_path: Path) -> None:
     first_server_port = _free_port()
     second_server_port = _free_port()
     client_port = _free_port()
     config_path = tmp_path / "remote.yaml"
-    _write_config(config_path, first_server_port, second_server_port)
+    location_config_path = tmp_path / "locations.yaml"
+    _write_config(
+        config_path,
+        location_config_path,
+        first_server_port,
+        second_server_port,
+    )
+    first_server = f"127.0.0.1:{first_server_port}"
+    second_server = f"127.0.0.1:{second_server_port}"
 
     servers: list[subprocess.Popen[str]] = []
     try:
@@ -143,7 +287,13 @@ def test_remoter_routes_functions_and_classes_across_processes(tmp_path: Path) -
         servers.append(_start_server(config_path, second_server_port, tmp_path / "server-2.log"))
 
         client = subprocess.run(
-            [sys.executable, "-m", "tests.remoter_test_client"],
+            [
+                sys.executable,
+                "-m",
+                "tests.remoter_test_client",
+                f"tcp://{first_server}",
+                f"tcp://{second_server}",
+            ],
             cwd=_RUNTIME_ROOT,
             env=_subprocess_env(config_path, client_port),
             capture_output=True,
@@ -173,6 +323,42 @@ def test_remoter_routes_functions_and_classes_across_processes(tmp_path: Path) -
             "singleton_same_id": True,
             "singleton_second_initial_value": 105,
             "singleton_shared_value": 110,
+            "constructor_replica_initial_locations": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "factory_replica_initial_locations": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "bundle_replica_initial_locations": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "returned_constructor_is_canonical": True,
+            "constructor_replica_first_value": 42,
+            "constructor_replica_first_pid": result["factory_server_pid"],
+            "constructor_replica_second_value": 40,
+            "constructor_replica_second_pid": result["constructor_server_pid"],
+            "factory_replica_first_value": 73,
+            "factory_replica_second_value": 70,
+            "bundle_replica_first_value": 94,
+            "bundle_replica_second_value": 90,
+            "constructor_replica_after_removal": [f"tcp://{first_server}"],
+            "factory_replica_after_removal": [f"tcp://{first_server}"],
+            "bundle_replica_after_removal": [f"tcp://{first_server}"],
+            "constructor_replica_after_addition": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "factory_replica_after_addition": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "bundle_replica_after_addition": sorted(
+                [f"tcp://{first_server}", f"tcp://{second_server}"]
+            ),
+            "constructor_replica_recreated_value": 40,
+            "factory_replica_recreated_value": 70,
+            "bundle_replica_recreated_value": 90,
+            "second_server_replica_locations": [f"tcp://{second_server}"],
+            "second_server_replica_pid": result["constructor_server_pid"],
+            "second_server_replica_value": 120,
         }
         assert "ValueError" in result["remote_error"]
         assert "expected remote failure" in result["remote_error"]

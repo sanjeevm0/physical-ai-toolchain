@@ -123,16 +123,19 @@ def watch_pods(v1api: client.CoreV1Api, resource_version: str, namespace: str, o
             pass
 
 def createconfig(keys : dict, locations : dict) -> dict:
-    config = {}
+    keylocations = {}
     for serverlabel, keyset in keys.items():
         for key in keyset:
-            config[key] = {
-                'locations': {}
+            keylocations.setdefault(key, set()).update(locations.get(serverlabel, set()))
+    return {
+        key: {
+            'locations': {
+                loc: 1.0 / len(keylocs)
+                for loc in keylocs
             }
-            if locations.get(serverlabel):
-                for loc in locations[serverlabel]:
-                    config[key]['locations'][loc] = 1.0 / len(locations[serverlabel])
-    return config
+        }
+        for key, keylocs in keylocations.items()
+    }
 
 def getparam(key, config, localconfig, default):
     ret = default
@@ -211,6 +214,11 @@ def rewrite_taskconfig(taskconfig : str):
     for cls in cfgnew.get("remoteclasses", []):
         for target_path, params in cls.items():
             # classes are remoteable based on config
+            if 'instantiateon' in params:
+                params['serverlabels'] = [
+                    getserverlabel(cfg, loc)
+                    for loc in params['instantiateon']
+                ]
             if 'remoteloc' in params:
                 serverlabel = getserverlabel(cfg, params['remoteloc'])
                 params['serverlabel'] = serverlabel
@@ -246,13 +254,14 @@ def get_keys(cfg):
     for cls in cfg.get("remoteclasses", []):
         for target_path, params in cls.items():
             key = params.get("classkey")
-            serverlabel = params.get("serverlabel", defserverlabel)
-            if serverlabel not in keys:
-                keys[serverlabel] = set()
-            if key:
-                keys[serverlabel].add(key)
-            else:
-                keys[serverlabel].add(target_path)
+            serverlabels = params.get("serverlabels", [params.get("serverlabel", defserverlabel)])
+            for serverlabel in serverlabels:
+                if serverlabel not in keys:
+                    keys[serverlabel] = set()
+                if key:
+                    keys[serverlabel].add(key)
+                else:
+                    keys[serverlabel].add(target_path)
     return keys
 
 initdone = False

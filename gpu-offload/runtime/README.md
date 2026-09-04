@@ -8,7 +8,7 @@ ms.topic: reference
 <!-- cspell:ignore msgtcp msgudp msgunix noremotefuncs remoteableon -->
 <!-- cspell:ignore remoteableserver REMOTERHOST REMOTERSOCK REMOTEPORT -->
 <!-- cspell:ignore rmtclass rmtconfig rmtconfigkube syncwithremote taskkey -->
-<!-- cspell:ignore functype -->
+<!-- cspell:ignore deallocates functype instantiateon -->
 
 The remoter runtime redirects selected Python function calls and class operations
 to another process while preserving the application-facing API. It supports direct
@@ -95,6 +95,7 @@ Common target parameters:
 | `functype` | Select the thread, pool, or process execution mode |
 | `timeout` | Limits how long the caller waits for completion |
 | `singleinstance` | Reuses one server-side function result or class instance |
+| `instantiateon` | Create one class instance at every listed location |
 | `noremotefuncs` | Keep selected configured class methods local |
 | `remoteableserver` | Allow server-side methods to route again |
 | `remoteableon` | Enables server-side remoting only at selected locations |
@@ -197,6 +198,45 @@ there and converted into a proxy before the result reaches the client. This
 allows the factory to select constructor inputs or build nested remote objects
 without performing construction in the client process.
 
+### Multi-location class instances
+
+Set `instantiateon` on a remote class to create one server-side instance at each
+configured location:
+
+```yaml
+remoteclasses:
+  - application.models/Policy:
+      instantiateon:
+        - 10.0.0.10:9000
+        - 10.0.0.11:9000
+```
+
+Both supported creation forms replicate the class:
+
+```python
+constructor_policy = Policy("pick-and-place")
+factory_policy = create_policy("pick-and-place")
+```
+
+Factory results can contain the class directly or inside lists, tuples, and
+dictionaries. The client keeps one logical proxy with a per-location object
+stub. Each method or attribute operation selects an active location using the
+class routing weights, then sends the location-specific object UUID.
+
+The location configuration overrides the initial `instantiateon` list after it
+loads. Adding a location replays the saved constructor or factory call there.
+Removing a location deallocates its server object and removes its cached stub.
+Calls only select active locations that have a successfully created instance.
+
+> [!IMPORTANT]
+> Replicas have independent state. A mutation routed to one location does not
+> update the other instances. Use multi-location classes for immutable models,
+> stateless services, or classes that synchronize state externally.
+
+`instantiateon` and `singleinstance` cannot be enabled on the same class.
+Multi-location creation currently requires synchronous constructors and factory
+functions.
+
 ## 🔒 Serialization and Errors
 
 The wire codec accepts bounded primitive collections, UUID values, registered
@@ -212,7 +252,7 @@ as `RemoteExecutionError`. Remote `AttributeError` values remain
 | File | Coverage |
 | ---- | -------- |
 | `test_safe_codec.py` | Codec, tensors, limits, and errors |
-| `test_remoter_integration.py` | Routing, factories, and singletons |
+| `test_remoter_integration.py` | Routing, factories, replicas, and singletons |
 | `remoter_test_fixture.py` | Shared remote functions and classes |
 | `remoter_test_client.py` | Isolated client assertions |
 

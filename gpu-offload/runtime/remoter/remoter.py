@@ -57,6 +57,7 @@ threadctx = ThreadContext()  # instantiated once per thread
 _CODEC_LIMITS = CodecLimits()
 _CODEC_REGISTRY = AdapterRegistry()
 _CODEC_CONTEXT = AdapterContext(role="remoter")
+_MULTI_LOCATION_REPLAY_TIMEOUT = 30.0
 
 
 def serialize_payload(obj) -> bytes:
@@ -139,6 +140,20 @@ class RemoteExecutionError(Exception):
     def __init__(self, descriptor: RemoteErrorDescriptor) -> None:
         self.descriptor = descriptor
         super().__init__(f"{descriptor.type_name}: {descriptor.message}\n{descriptor.traceback}")
+
+
+@dataclass
+class MultiLocationCreation:
+    creation_id: uuid.UUID
+    taskname: str
+    functype: str
+    nowait: bool
+    func: Callable
+    args: tuple
+    kwargs: dict
+    constructor: bool
+    timeout: float | None
+    objects: dict[tuple, Any]
 
 
 stub_to_class = {}  # stub class to actual class
@@ -401,6 +416,8 @@ class MetaRemotedUUID:
         x.rmtowner_rmt0bf = False  # set to True for server side once __init__ is called
         x.failed_rmt0bf = False
         x.remotedclasskey_rmt0bf = remotedclasskey[type(x)]
+        x.rmtinstances_rmt0bf = {}
+        x.rmtcreationid_rmt0bf = None
         logger.debug(f"Created instance of type {type(x)} with ID {self.uuid_rmt0bf} at location {self.rmtloc_rmt0bf}")
         return x
 
@@ -519,6 +536,8 @@ def initfields(x):
     x.failed_rmt0bf = False  # only valid on client side
     x.rmtowner_rmt0bf = False  # for both client and server side
     x.remotedclasskey_rmt0bf = remotedclasskey[type(x)]
+    x.rmtinstances_rmt0bf = {}
+    x.rmtcreationid_rmt0bf = None
 
 
 nodehydrate = ["remoter.rmtclass//_getfromremote"]
@@ -630,6 +649,10 @@ def dehydrate(obj: Any, key: str, remotedclasscache: dict, loc: str, isresult: b
                 obj.rmtloc_rmt0bf = loc
                 obj.rmtowner_rmt0bf = True
         ret = MetaRemotedUUID(obj)
+        if not isresult:
+            instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+            if loc in instances:
+                ret = copy.copy(instances[loc])
         logger.info(f"Dehydrating for key {key}")
         logger.info(
             f"Dehydrating remoted class of type {obj.__class__} with ID {obj.uuid_rmt0bf} - dehydrate={dehydratermt} result={isresult}"
@@ -933,6 +956,9 @@ class Remoter:
         self.runloc = {}
         self.waitevents = {}
         self.loclock = threading.Lock()  # lock for runloc
+        self.multiLocationCreations: dict[uuid.UUID, MultiLocationCreation] = {}
+        self.multiLocationObjectsByUUID: dict[uuid.UUID, Any] = {}
+        self.multiLocationLock = threading.RLock()
         if locconfig is not None:
             logger.info(f"Using locconfig: {locconfig}")
             self.locconfig = rmtconfig.Config(locconfig, self.updateRunLoc)
@@ -993,6 +1019,9 @@ class Remoter:
 
     def updateRunLoc(self, runlocconfig):
         with self.loclock:
+            changed_keys = set(runlocconfig) | (set(self.runloc) - set(runlocconfig))
+            for key in set(self.runloc) - set(runlocconfig):
+                self.runloc[key] = {"choices": [], "weights": []}
             for k, v in runlocconfig.items():
                 self.runloc[k] = {}
                 self.runloc[k]["choices"] = list(v["locations"].keys())
@@ -1016,6 +1045,7 @@ class Remoter:
                             if v["locations"].get(loc, 0.0) == 0.0:
                                 logger.debug(f"Cancelling function {uid} at location {loc} due to runloc change")
                                 self.cancelRemotedFunction(uid)  # cancel the function if its location is not allowed
+        self.reconcileMultiLocationClasses(changed_keys)
 
     def onlyRunServer(self):
         # run the server only
@@ -1129,8 +1159,21 @@ class Remoter:
                 self.setfnevent(fnid)
                 # but keep the result not present in the dictionary so we know the function was not completed
             for classuid, obj in conn["classes"].items():
-                obj.failed_rmt0bf = True
                 self.remotedClassesConn.pop(classuid, None)
+                canonical = self.multiLocationObjectsByUUID.get(classuid, obj)
+                if self.isMultiLocationClass(canonical):
+                    with self.multiLocationLock:
+                        instances = object.__getattribute__(canonical, "rmtinstances_rmt0bf")
+                        if loc in instances and instances[loc].uuid_rmt0bf == classuid:
+                            instances.pop(loc)
+                        self.multiLocationObjectsByUUID.pop(classuid, None)
+                        if instances and canonical.uuid_rmt0bf == classuid:
+                            first_stub = next(iter(instances.values()))
+                            canonical.uuid_rmt0bf = first_stub.uuid_rmt0bf
+                            canonical.rmtloc_rmt0bf = first_stub.rmtloc_rmt0bf
+                        canonical.failed_rmt0bf = not instances
+                else:
+                    canonical.failed_rmt0bf = True
 
     def runfunc(self, func, *args, **kwargs):
         # get the function object
@@ -1262,6 +1305,9 @@ class Remoter:
         if isremotedclass and args[0].failed_rmt0bf:
             raise Exception("Class is in a failed state -- cannot run function")
 
+        if isremotedclass and self.isMultiLocationClass(args[0]):
+            return self.getMultiLocationRunLoc(taskname, actclasskey, key, args[0])
+
         for arg in args:
             # if a location set, use that location & set the location for the first argument if it is a remoted class
             if localhasattr(arg, "rmtloc_rmt0bf") and arg.rmtloc_rmt0bf is not None:
@@ -1373,6 +1419,25 @@ class Remoter:
                     conn["conn"].senddata(msg)
 
     def deallocateClass(self, obj):
+        if self.isMultiLocationClass(obj):
+            with self.multiLocationLock:
+                instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+                for stub in list(instances.values()):
+                    self.deallocateClassStub(stub)
+                    self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
+                instances.clear()
+                creation_id = object.__getattribute__(obj, "rmtcreationid_rmt0bf")
+                if creation_id is not None:
+                    record = self.multiLocationCreations.get(creation_id)
+                    if record is not None:
+                        record.objects = {
+                            path: record_obj
+                            for path, record_obj in record.objects.items()
+                            if record_obj is not obj
+                        }
+                        if not record.objects:
+                            self.multiLocationCreations.pop(creation_id, None)
+            return
         _, classuid = self.isremotedclass((obj,))
         if classuid is not None:
             logger.debug(f"Deallocating class with ID {classuid}")
@@ -1389,6 +1454,27 @@ class Remoter:
                     conn = self.remotedClassesConn.get(classuid, None)
                     if conn is not None:
                         conn.senddata(msg)
+
+    def deallocateClassStub(self, stub: MetaRemotedUUID) -> None:
+        classuid = stub.uuid_rmt0bf
+        loc = stub.rmtloc_rmt0bf
+        logger.debug(f"Deallocating class stub with ID {classuid} at {loc}")
+        if self.islocself(loc):
+            self.addClassForCleanup(classuid)
+            return
+        msg = int.to_bytes(MessageType.DeallocateClass, 1, "big") + classuid.bytes
+        if loc == "directqueue":
+            self.fnqueueProc.putMessage(msg)
+            return
+        conn = self.remotedClassesConn.pop(classuid, None)
+        with self.connlock:
+            conninfo = self.conns.get(loc)
+            if conninfo is not None:
+                conninfo["classes"].pop(classuid, None)
+        if conn is None:
+            conn = conninfo["conn"] if conninfo is not None else None
+        if conn is not None:
+            conn.senddata(msg)
 
     def initrmtclassonclient(self, *args):
         if len(args) > 0:
@@ -1422,9 +1508,16 @@ class Remoter:
                 assert False, "Single instance non-remoteable classes cannot run remoted functions"
         else:
             actclasskey = None
-        loc, classuid = self.getrunloc(taskname, actclasskey, key, *args)
-        if fixedloc is not None:
-            loc = fixedloc  # override the location if fixedloc is provided
+        use_fixed_location = fixedloc is not None and (
+            not (isremotedclass and self.isMultiLocationClass(args[0]))
+            or func_name == "__init__"
+        )
+        if use_fixed_location:
+            loc = fixedloc
+            if isremotedclass:
+                args[0].rmtloc_rmt0bf = loc
+        else:
+            loc, classuid = self.getrunloc(taskname, actclasskey, key, *args)
         isasync = inspect.iscoroutinefunction(func)
         uid = uuid.uuid4()
         taskinfo = {"loc": loc, "func_name": func_name, "args": args}
@@ -1491,6 +1584,345 @@ class Remoter:
                 # send the message to the server
                 success = conn.senddata(msg)
                 return success, uid, event
+
+    def isMultiLocationClass(self, obj: Any) -> bool:
+        return bool(getattr(type(obj), "instantiateon_rmt0bf", ()))
+
+    def normalizeLocation(self, loc: str, key: str, actclasskey: str) -> str:
+        if self.rmtport is not None and self.rmtport != 0 and not loc.startswith("unix:"):
+            protocol = ""
+            addr = loc
+            if "://" in loc:
+                protocol, addr = loc.split("://", 1)
+            host = addr.split(":", 1)[0]
+            loc = f"{protocol}://{host}:{self.rmtport}" if protocol else f"{host}:{self.rmtport}"
+        return modifyloc(loc, key, actclasskey)
+
+    def getInstantiationLocations(self, obj: Any) -> list[str]:
+        cls = type(obj)
+        actclasskey = classkey(cls)
+        taskname = remotedclasskey[cls]
+        configured = list(getattr(cls, "instantiateon_rmt0bf", ()))
+        with self.loclock:
+            runloc = self.runloc.get(taskname)
+            choices = list(runloc["choices"]) if runloc is not None else configured
+        locations = [self.normalizeLocation(loc, actclasskey + "/", actclasskey) for loc in choices]
+        return list(dict.fromkeys(locations))
+
+    def getMultiLocationRunLoc(
+        self,
+        taskname: str,
+        actclasskey: str | None,
+        key: str,
+        obj: Any,
+    ) -> tuple[str, uuid.UUID]:
+        with self.multiLocationLock:
+            instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+            if not instances:
+                raise RuntimeError(f"Multi-location class {type(obj)} has no instantiated locations")
+
+            class_key = actclasskey or classkey(type(obj))
+            with self.loclock:
+                runloc = self.runloc.get(taskname)
+                if runloc is None:
+                    choices = list(instances)
+                    weights = [1.0] * len(choices)
+                else:
+                    normalized = [
+                        self.normalizeLocation(loc, class_key + "/", class_key)
+                        for loc in runloc["choices"]
+                    ]
+                    available = [
+                        (loc, weight)
+                        for loc, weight in zip(normalized, runloc["weights"], strict=True)
+                        if loc in instances
+                    ]
+                    choices = [loc for loc, _ in available]
+                    weights = [weight for _, weight in available]
+
+            if key in fixedlocs:
+                fixed = self.normalizeLocation(fixedlocs[key], class_key + "/", class_key)
+                if fixed in instances:
+                    choices = [fixed]
+                    weights = [1.0]
+            if not choices:
+                raise RuntimeError(
+                    f"Multi-location class {type(obj)} has no instance at an active location for task {taskname}"
+                )
+            if sum(weights) <= 0:
+                raise RuntimeError(f"Multi-location class {type(obj)} has no location with positive routing weight")
+
+            loc = random.choices(choices, weights)[0]
+            stub = instances[loc]
+            logger.debug(
+                f"Selected multi-location class {type(obj)} instance {stub.uuid_rmt0bf} at {loc}"
+            )
+            return loc, stub.uuid_rmt0bf
+
+    def addMultiLocationStub(self, obj: Any, source: Any, creation_id: uuid.UUID) -> None:
+        stub = MetaRemotedUUID(source)
+        instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+        instances[stub.rmtloc_rmt0bf] = stub
+        self.multiLocationObjectsByUUID[stub.uuid_rmt0bf] = obj
+        if stub.rmtloc_rmt0bf not in ["direct", "directqueue"]:
+            with self.connlock:
+                conn = self.conns.get(stub.rmtloc_rmt0bf)
+                if conn is not None:
+                    conn["classes"][stub.uuid_rmt0bf] = obj
+        obj.rmtcreationid_rmt0bf = creation_id
+        obj.failed_rmt0bf = False
+        if len(instances) == 1:
+            obj.uuid_rmt0bf = stub.uuid_rmt0bf
+            obj.rmtloc_rmt0bf = stub.rmtloc_rmt0bf
+
+    def collectMultiLocationObjects(self, value: Any, path: tuple = ()) -> dict[tuple, Any]:
+        if type(value) in remotedclasses and self.isMultiLocationClass(value):
+            return {path: value}
+        if isinstance(value, (list, tuple)):
+            objects = {}
+            for index, item in enumerate(value):
+                objects.update(self.collectMultiLocationObjects(item, path + (index,)))
+            return objects
+        if isinstance(value, dict):
+            objects = {}
+            for key, item in value.items():
+                objects.update(self.collectMultiLocationObjects(item, path + (key,)))
+            return objects
+        return {}
+
+    def collectNewMultiLocationObjects(self, value: Any) -> dict[tuple, Any]:
+        return {
+            path: obj
+            for path, obj in self.collectMultiLocationObjects(value).items()
+            if object.__getattribute__(obj, "uuid_rmt0bf") not in self.multiLocationObjectsByUUID
+        }
+
+    def replaceKnownMultiLocationObjects(self, value: Any) -> Any:
+        if type(value) in remotedclasses and self.isMultiLocationClass(value):
+            classuid = object.__getattribute__(value, "uuid_rmt0bf")
+            return self.multiLocationObjectsByUUID.get(classuid, value)
+        if isinstance(value, list):
+            return [self.replaceKnownMultiLocationObjects(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.replaceKnownMultiLocationObjects(item) for item in value)
+        if isinstance(value, dict):
+            return {
+                key: self.replaceKnownMultiLocationObjects(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def createMultiLocationConstructor(
+        self,
+        taskname: str,
+        functype: str,
+        nowait: bool,
+        timeout: float | None,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        canonical = args[0]
+        locations = self.getInstantiationLocations(canonical)
+        if not locations:
+            raise RuntimeError(f"No instantiation locations configured for {type(canonical)}")
+        with self.multiLocationLock:
+            creation_id = uuid.uuid4()
+            record = MultiLocationCreation(
+                creation_id=creation_id,
+                taskname=taskname,
+                functype=functype,
+                nowait=nowait,
+                func=func,
+                args=copyobj(args[1:]),
+                kwargs=copyobj(kwargs),
+                constructor=True,
+                timeout=timeout,
+                objects={(): canonical},
+            )
+            self.multiLocationCreations[creation_id] = record
+            created: list[MetaRemotedUUID] = []
+            try:
+                for index, loc in enumerate(locations):
+                    if index == 0:
+                        instance = canonical
+                    else:
+                        instance = getclassinstancefromname(classkey(type(canonical)))
+                    initfields(instance)
+                    call_args = (instance, *args[1:])
+                    self.runSyncFunctionOnce(taskname, functype, nowait, timeout, loc, func, *call_args, **kwargs)
+                    self.addMultiLocationStub(canonical, instance, creation_id)
+                    created.append(MetaRemotedUUID(instance))
+            except Exception:
+                self.multiLocationCreations.pop(creation_id, None)
+                for stub in created:
+                    self.deallocateClassStub(stub)
+                    self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
+                canonical.failed_rmt0bf = True
+                raise
+
+    def registerFactoryCreation(
+        self,
+        result: Any,
+        result_loc: str,
+        taskname: str,
+        functype: str,
+        nowait: bool,
+        timeout: float | None,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        result = self.replaceKnownMultiLocationObjects(result)
+        if args and localhasattr(args[0], "uuid_rmt0bf"):
+            new_objects = self.collectNewMultiLocationObjects(result)
+            if new_objects:
+                for obj in new_objects.values():
+                    self.deallocateClassStub(MetaRemotedUUID(obj))
+                raise RuntimeError("Multi-location creation from remote methods is not supported")
+            return result
+        objects = self.collectNewMultiLocationObjects(result)
+        if not objects:
+            return result
+        if result_loc is None:
+            raise RuntimeError("Multi-location factory creation requires a known execution location")
+
+        with self.multiLocationLock:
+            creation_id = uuid.uuid4()
+            record = MultiLocationCreation(
+                creation_id=creation_id,
+                taskname=taskname,
+                functype=functype,
+                nowait=nowait,
+                func=func,
+                args=copyobj(args),
+                kwargs=copyobj(kwargs),
+                constructor=False,
+                timeout=timeout,
+                objects=objects,
+            )
+            self.multiLocationCreations[creation_id] = record
+            try:
+                target_by_path = {
+                    path: set(self.getInstantiationLocations(obj))
+                    for path, obj in objects.items()
+                }
+                for path, obj in objects.items():
+                    if result_loc in target_by_path[path]:
+                        self.addMultiLocationStub(obj, obj, creation_id)
+                    else:
+                        self.deallocateClassStub(MetaRemotedUUID(obj))
+
+                target_locations = set().union(*target_by_path.values())
+                for loc in target_locations - {result_loc}:
+                    replica, _ = self.runSyncFunctionOnce(
+                        taskname,
+                        functype,
+                        nowait,
+                        timeout,
+                        loc,
+                        func,
+                        *args,
+                        **kwargs,
+                        return_location=True,
+                    )
+                    replica_objects = self.collectMultiLocationObjects(replica)
+                    if replica_objects.keys() != objects.keys():
+                        raise RuntimeError("Remote creation function returned a different object structure")
+                    for path, obj in objects.items():
+                        replica_obj = replica_objects[path]
+                        if loc in target_by_path[path]:
+                            self.addMultiLocationStub(obj, replica_obj, creation_id)
+                        else:
+                            self.deallocateClassStub(MetaRemotedUUID(replica_obj))
+            except Exception:
+                self.multiLocationCreations.pop(creation_id, None)
+                for obj in objects.values():
+                    instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+                    for stub in list(instances.values()):
+                        self.deallocateClassStub(stub)
+                        self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
+                    instances.clear()
+                    obj.failed_rmt0bf = True
+                raise
+        return result
+
+    def replayMultiLocationCreation(self, record: MultiLocationCreation, loc: str) -> None:
+        if record.constructor:
+            canonical = record.objects[()]
+            instance = getclassinstancefromname(classkey(type(canonical)))
+            initfields(instance)
+            self.runSyncFunctionOnce(
+                record.taskname,
+                record.functype,
+                record.nowait,
+                record.timeout or _MULTI_LOCATION_REPLAY_TIMEOUT,
+                loc,
+                record.func,
+                instance,
+                *copyobj(record.args),
+                **copyobj(record.kwargs),
+            )
+            self.addMultiLocationStub(canonical, instance, record.creation_id)
+            return
+
+        replica, _ = self.runSyncFunctionOnce(
+            record.taskname,
+            record.functype,
+            record.nowait,
+            record.timeout or _MULTI_LOCATION_REPLAY_TIMEOUT,
+            loc,
+            record.func,
+            *copyobj(record.args),
+            **copyobj(record.kwargs),
+            return_location=True,
+        )
+        replica_objects = self.collectMultiLocationObjects(replica)
+        if replica_objects.keys() != record.objects.keys():
+            raise RuntimeError("Remote creation function returned a different object structure")
+        for path, obj in record.objects.items():
+            replica_obj = replica_objects[path]
+            instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+            if loc in self.getInstantiationLocations(obj) and loc not in instances:
+                self.addMultiLocationStub(obj, replica_obj, record.creation_id)
+            else:
+                self.deallocateClassStub(MetaRemotedUUID(replica_obj))
+
+    def reconcileMultiLocationClasses(self, changed_keys: set[str]) -> None:
+        with self.multiLocationLock:
+            for record in list(self.multiLocationCreations.values()):
+                relevant = any(remotedclasskey[type(obj)] in changed_keys for obj in record.objects.values())
+                if not relevant:
+                    continue
+                try:
+                    target_by_path = {
+                        path: set(self.getInstantiationLocations(obj))
+                        for path, obj in record.objects.items()
+                    }
+                    missing_locations = set().union(
+                        *(
+                            target_by_path[path]
+                            - set(object.__getattribute__(obj, "rmtinstances_rmt0bf"))
+                            for path, obj in record.objects.items()
+                        )
+                    )
+                    for loc in missing_locations:
+                        self.replayMultiLocationCreation(record, loc)
+                    for path, obj in record.objects.items():
+                        instances = object.__getattribute__(obj, "rmtinstances_rmt0bf")
+                        for loc in set(instances) - target_by_path[path]:
+                            stub = instances.pop(loc)
+                            self.deallocateClassStub(stub)
+                            self.multiLocationObjectsByUUID.pop(stub.uuid_rmt0bf, None)
+                        if instances and obj.rmtloc_rmt0bf not in instances:
+                            first_stub = next(iter(instances.values()))
+                            obj.uuid_rmt0bf = first_stub.uuid_rmt0bf
+                            obj.rmtloc_rmt0bf = first_stub.rmtloc_rmt0bf
+                        obj.failed_rmt0bf = not instances
+                except Exception:
+                    logger.exception(
+                        f"Failed to reconcile multi-location creation {record.creation_id}",
+                    )
 
     def getResult(self, taskname, uid) -> tuple[Any, Exception | None]:
         with self.fnlock:
@@ -1564,6 +1996,12 @@ class Remoter:
         logger.debug(f"Event with hash {hash(event)} set")
         result, ex = self.getResult(taskname, uid)
         if ex is None:
+            result = self.replaceKnownMultiLocationObjects(result)
+            new_objects = self.collectNewMultiLocationObjects(result)
+            if new_objects:
+                for obj in new_objects.values():
+                    self.deallocateClassStub(MetaRemotedUUID(obj))
+                raise RuntimeError("Async multi-location creation functions are not supported")
             return result
         else:
             raise ex
@@ -1580,9 +2018,21 @@ class Remoter:
         else:
             raise ex
 
-    def runSyncFunction(self, taskname, functype, nowait, timeout, loc, func, *args, **kwargs):
+    def runSyncFunctionOnce(
+        self,
+        taskname,
+        functype,
+        nowait,
+        timeout,
+        loc,
+        func,
+        *args,
+        return_location=False,
+        **kwargs,
+    ):
         if is_process:
-            return self.runSyncFunctionProc(taskname, functype, nowait, loc, func, *args, **kwargs)
+            result = self.runSyncFunctionProc(taskname, functype, nowait, loc, func, *args, **kwargs)
+            return (result, loc) if return_location else result
         success, uid, event = self.runRemotedfunction(taskname, functype, nowait, loc, func, *args, **kwargs)
         if not success:
             raise Exception(f"Function {taskname} with uid {uid} not found in results - perhaps connection closed")
@@ -1595,6 +2045,8 @@ class Remoter:
                 raise Exception(f"Function {taskname} with uid {uid} timed out after {timeout} seconds")
         else:
             event.wait()
+        with self.fnlock:
+            result_loc = self.tasks[uid]["loc"]
         result, ex = self.getResult(taskname, uid)
         # try:
         #     print("Result type:", type(result))
@@ -1602,9 +2054,47 @@ class Remoter:
         # except Exception:
         #     pass
         if ex is None:
+            if return_location:
+                return result, result_loc
             return result
         else:
             raise ex
+
+    def runSyncFunction(self, taskname, functype, nowait, timeout, loc, func, *args, **kwargs):
+        _, _, func_name, _ = getfuncname(func)
+        if (
+            func_name == "__init__"
+            and len(args) > 0
+            and type(args[0]) in remotedclasses
+            and self.isMultiLocationClass(args[0])
+        ):
+            if loc is not None:
+                raise RuntimeError("Fixed locations are not supported for multi-location constructors")
+            self.createMultiLocationConstructor(taskname, functype, nowait, timeout, func, args, kwargs)
+            return None
+
+        result, result_loc = self.runSyncFunctionOnce(
+            taskname,
+            functype,
+            nowait,
+            timeout,
+            loc,
+            func,
+            *args,
+            return_location=True,
+            **kwargs,
+        )
+        return self.registerFactoryCreation(
+            result,
+            result_loc,
+            taskname,
+            functype,
+            nowait,
+            timeout,
+            func,
+            args,
+            kwargs,
+        )
 
     def runfunctionrmt(self, taskname, functype, nowait, timeout, fixedloc, func, *args, **kwargs):
         # run a function on a remote server

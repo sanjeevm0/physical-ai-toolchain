@@ -210,7 +210,14 @@ def allowallfunctions(cls, isserver):
     assert initfound, "No __init__ method found in remoted class"
     remoteableclass = isremoteable(isserver, actclasskey+"/", actclasskey)
     singleinstanceclass = remoter.getparam("singleinstance", actclasskey+"/", actclasskey, False)
+    instantiateon = remoter.getparam("instantiateon", actclasskey+"/", actclasskey, [])
+    if not isinstance(instantiateon, list) or not all(isinstance(loc, str) for loc in instantiateon):
+        raise TypeError(f"instantiateon for {actclasskey} must be a list of locations")
+    if instantiateon and singleinstanceclass:
+        raise ValueError(f"{actclasskey} cannot use both instantiateon and singleinstance")
     remotelocclass = remoter.getparam("remoteloc", actclasskey+"/", actclasskey, None)
+    if instantiateon and remotelocclass is not None:
+        raise ValueError(f"{actclasskey} cannot use both instantiateon and remoteloc")
     if remotelocclass is not None:
         remoter.setfixedlocs({actclasskey: remotelocclass})
     logger.info(f"Class {actclasskey} remoteable={remoteableclass} remoteloc={remotelocclass} singleinstance={singleinstanceclass}",
@@ -224,6 +231,7 @@ def allowallfunctions(cls, isserver):
     # class attributes
     setattr(cls, "remoteable_rmt0bf", remoteableclass)
     setattr(cls, "singleinstance_rmt0bf", singleinstanceclass)
+    cls.instantiateon_rmt0bf = tuple(instantiateon)
     if remoteableclass:
         setattr(cls, "__getattribute__", getattribute)
         setattr(cls, "__setattr__", setattribute)
